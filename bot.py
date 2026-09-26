@@ -48,6 +48,33 @@ def _merchant_name(merchant: dict[str, Any]) -> str:
     return _text((merchant.get("identity") or {}).get("name"), "your business")
 
 
+def _locality(merchant: dict[str, Any]) -> str:
+    identity = merchant.get("identity") or {}
+    locality = _text(identity.get("locality"))
+    city = _text(identity.get("city"))
+    return ", ".join(part for part in (locality, city) if part)
+
+
+def _category_action(slug: str, positive: bool = False) -> str:
+    if slug == "dentists":
+        return "a patient-ready clinical post" if positive else "a recall/profile conversion fix"
+    if slug == "salons":
+        return "a rebooking or festive appointment post" if positive else "a rebooking message"
+    if slug == "restaurants":
+        return "a menu or delivery-led post" if positive else "a delivery/operations fix"
+    if slug == "gyms":
+        return "a coaching-led post" if positive else "a member-retention action"
+    if slug == "pharmacies":
+        return "a precise availability/delivery update" if positive else "a stock or delivery fix"
+    return "one grounded customer-facing action"
+
+
+def _trend_label(value: Any) -> str:
+    """Make machine-shaped trend keys readable without changing their facts."""
+    raw = _text(value).replace("_", " ")
+    return re.sub(r"\s+", " ", raw).strip()
+
+
 def _category_slug(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[str, Any]) -> str:
     return _text(category.get("slug") or merchant.get("category_slug") or (trigger.get("payload") or {}).get("category"), "business")
 
@@ -282,11 +309,12 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         if summary:
             parts.append(_compact(summary, 200))
         signals = " ".join(_text(s) for s in (merchant.get("signals") or []))
-        if "high_risk" in signals.lower() or (merchant.get("customer_aggregate") or {}).get("high_risk_adult_count"):
-            parts.append("That is especially relevant to the high-risk cohort in your records.")
-        parts.append("Want me to turn the useful point into one patient-ready post?")
+        high_risk = (merchant.get("customer_aggregate") or {}).get("high_risk_adult_count")
+        if "high_risk" in signals.lower() or high_risk:
+            parts.append(f"It is especially relevant to the { _number(high_risk) if high_risk else 'high-risk'} adult patients in your records.")
+        parts.append("Reply YES and I’ll turn this item into one patient-ready post.")
         body = " ".join(parts)
-        cta = "open_ended"
+        cta = "binary_yes_no"
         fact = f"digest headline{(' and source ' + source) if source else ''}"
     elif kind in {"regulation_change", "compliance_alert", "compliance"}:
         item = _digest_item(category, trigger)
@@ -300,52 +328,58 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
             body += f" The deadline is {deadline}."
         if summary:
             body += f" {_compact(summary, 220)}"
-        body += f" Suggested next step: {action}. Want me to turn that into a short audit checklist?"
-        cta = "open_ended"
+        body += f" Suggested next step for this practice: {action}. Reply YES and I’ll turn it into a short audit checklist."
+        cta = "binary_yes_no"
         fact = f"compliance headline and {source or 'provided'} source"
     elif kind in {"perf_dip", "seasonal_perf_dip"}:
         metric, change, current = _metric_snapshot(merchant, payload)
         peer = (category.get("peer_stats") or {}).get(f"avg_{payload.get('metric')}_30d")
+        baseline = payload.get("vs_baseline")
         expected = " The trigger marks this as seasonal, so I would not overreact." if payload.get("is_expected_seasonal") else ""
         peer_bit = f" Peer average is {_number(peer)}." if peer is not None else ""
         current_bit = f" Current {metric}: {current}." if current else ""
-        body = f"{name}, your {metric} is {change or 'down'} over {payload.get('window', 'the current window')}.{current_bit}{peer_bit}{expected} Want me to draft one focused recovery/retention action for this window?"
-        cta = "open_ended"
-        fact = f"{metric} change {change or 'from the trigger'}"
+        baseline_bit = f" The supplied baseline is {_number(baseline)}." if baseline is not None else ""
+        body = f"{name}, your {metric} is {change or 'down'} over {payload.get('window', 'the current window')}.{current_bit}{baseline_bit}{peer_bit}{expected} I recommend {_category_action(slug)}. Reply YES and I’ll draft it."
+        cta = "binary_yes_no"
+        fact = f"{metric} change {change or 'from the trigger'} and baseline {baseline or 'not supplied'}"
     elif kind in {"perf_spike", "milestone_reached"}:
         metric, change, current = _metric_snapshot(merchant, payload)
         driver = _text(payload.get("likely_driver"), "the recent activity")
         milestone = payload.get("milestone_value")
         if kind == "milestone_reached" or milestone is not None:
             value = _number(payload.get("value_now"))
-            body = f"{name}, you are at {value or 'the latest'} {metric}; the next milestone is {milestone or 'in view'}. Nice moment to make the proof visible. Want me to draft the GBP post?"
+            body = f"{name}, you are at {value or 'the latest'} {metric}; the next milestone is {milestone or 'in view'}. Nice moment to make that proof visible in your listing. Reply YES and I’ll draft the GBP post."
             fact = f"milestone value {value or milestone}"
         else:
-            body = f"{name}, {metric} is up {change or 'in the latest window'}; the likely driver is {driver}. Want me to turn that winning signal into one repeatable post?"
+            baseline = payload.get("vs_baseline")
+            baseline_bit = f" from the supplied baseline of {_number(baseline)}" if baseline is not None else ""
+            body = f"{name}, {metric} is up {change or 'in the latest window'}{baseline_bit}; the likely driver is {driver.replace('_', ' ')}. Reply YES and I’ll turn that winning signal into {_category_action(slug, positive=True)}."
             fact = f"{metric} movement {change or 'from the trigger'}"
-        cta = "open_ended"
+        cta = "binary_yes_no"
     elif kind in {"renewal_due"}:
         days = payload.get("days_remaining", (merchant.get("subscription") or {}).get("days_remaining"))
         plan = _text(payload.get("plan"), _text((merchant.get("subscription") or {}).get("plan"), "current plan"))
         amount = payload.get("renewal_amount")
         amount_bit = f" at ₹{_number(amount)}" if amount is not None else ""
-        body = f"{name}, your {plan} subscription has {days if days is not None else 'limited'} days left{amount_bit}. If you want continuity, shall I prepare the renewal link/checklist?"
+        body = f"{name}, your {plan} subscription has {days if days is not None else 'limited'} days left{amount_bit}. Reply YES and I’ll prepare the renewal link before it lapses."
         cta = "binary_yes_no"
         fact = f"subscription status with {days if days is not None else 'the supplied'} days remaining"
     elif kind in {"festival_upcoming", "festival", "category_seasonal"}:
         if kind == "category_seasonal":
             trends = payload.get("trends") or []
-            trend = _text(trends[0]) if trends else "the supplied seasonal shift"
-            body = f"{name}, the seasonal signal to act on is {trend}. For {_category_slug(category, merchant, trigger)}, that is a better reason to adjust the shelf/content mix than to run a generic discount. Want me to draft the update?"
+            trend_bits = ", ".join(_trend_label(item) for item in trends[:2])
+            trend = trend_bits or "the supplied seasonal shift"
+            body = f"{name}, the seasonal signal is {trend}. For your pharmacy in {_locality(merchant) or 'your locality'}, adjust the shelf/content mix before reaching for a generic discount. Reply YES and I’ll draft the precise update."
             fact = f"seasonal signal {trend}"
         else:
             festival = _text(payload.get("festival"), "the upcoming festival")
             date = _date_label(payload.get("date"))
             offer = _offer_text(merchant)
             offer_bit = f" Your live offer is {offer}." if offer else ""
-            body = f"{name}, {festival} is on {date or 'the date in the trigger'}{'.' if date else ''}{offer_bit} Want me to turn the offer you already have into one timely local post?"
+            category_angle = {"salons": "festive appointment", "restaurants": "local dining", "pharmacies": "seasonal essentials"}.get(slug, "timely local")
+            body = f"{name}, {festival} is on {date or 'the date in the trigger'}{'.' if date else ''}{offer_bit} I recommend a {category_angle} angle for {_locality(merchant) or 'your locality'}. Reply YES and I’ll draft the post."
             fact = f"{festival} date {date or 'from the trigger'}"
-        cta = "open_ended"
+        cta = "binary_yes_no"
     elif kind in {"ipl_match_today", "match_today"}:
         match = _text(payload.get("match"), "today's match")
         venue = _text(payload.get("venue"))
@@ -354,40 +388,43 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         channel = "delivery-first" if payload.get("is_weeknight") is False else "match-night"
         offer_bit = f" Use your active {offer} as the anchor." if offer else ""
         venue_bit = f" at {venue}" if venue else ""
-        body = f"Quick heads-up {name}: {match}{venue_bit} is scheduled for {when or 'the supplied time'}. I would test a {channel} angle rather than a generic promo.{offer_bit} Want me to draft the customer-facing copy?"
-        cta = "open_ended"
+        body = f"Quick heads-up {name}: {match}{venue_bit} is scheduled for {when or 'the supplied time'}. I would test a {channel} angle for {_locality(merchant) or 'your locality'} rather than a generic promo.{offer_bit} Reply YES and I’ll draft the customer-facing copy."
+        cta = "binary_yes_no"
         fact = f"match {match} and time {when or 'from the trigger'}"
     elif kind in {"review_theme_emerged", "review_theme"}:
         theme = _text(payload.get("theme"), "the review theme")
         count = payload.get("occurrences_30d")
         quote = _text(payload.get("common_quote"))
         quote_bit = f' One customer wrote, "{_compact(quote, 120)}".' if quote else ""
-        body = f"{name}, {theme.replace('_', ' ')} has appeared {count or 'multiple times'} in the last 30 days and is {payload.get('trend', 'worth addressing')}.{quote_bit} Want me to draft a reply/process fix for this one theme?"
-        cta = "open_ended"
+        body = f"{name}, {theme.replace('_', ' ')} has appeared {count or 'multiple times'} in the last 30 days and is {payload.get('trend', 'worth addressing')}.{quote_bit} Reply YES and I’ll draft one customer reply plus the operational fix."
+        cta = "binary_yes_no"
         fact = f"{count or 'repeated'} reviews mentioning {theme}"
     elif kind in {"active_planning_intent", "planning_intent"}:
         last = _history_last(merchant, "merchant")
+        prior_vera = _history_last(merchant, "vera")
         last_msg = _text(payload.get("merchant_last_message"), _text(last.get("body")))
         topic = _text(payload.get("intent_topic"), "the idea you raised").replace("_", " ")
         offer = _offer_text(merchant)
         offer_bit = f" Your live offer is {offer}." if offer else ""
-        body = f"{name}, picking up your note on {topic}: “{_compact(last_msg, 180)}”{offer_bit} I can draft a first version using only the details already on file. Shall I make it now?"
+        prior_bit = f" The earlier plan in this thread was: {_compact(prior_vera.get('body'), 150)}." if prior_vera else ""
+        body = f"{name}, picking up your note on {topic}: “{_compact(last_msg, 180)}”{offer_bit}{prior_bit} Reply YES and I’ll turn the existing details into one reviewable draft."
         cta = "binary_yes_no"
         fact = f"the merchant's stated planning intent: {topic}"
     elif kind in {"supply_alert", "supply_recall"}:
         molecule = _text(payload.get("molecule"), "the affected medicine")
         batches = ", ".join(_text(x) for x in (payload.get("affected_batches") or [])[:5])
-        total = (merchant.get("customer_aggregate") or {}).get("chronic_rx_customers")
+        aggregate = merchant.get("customer_aggregate") or {}
+        total = aggregate.get("chronic_rx_customers", aggregate.get("chronic_rx_count"))
         total_bit = f" You have {total} chronic-Rx customers in the supplied aggregate." if total is not None else ""
-        body = f"{name}, supply alert for {molecule}: batches {batches or 'listed in the trigger'} from {_text(payload.get('manufacturer'), 'the named manufacturer')}.{total_bit} Please hold affected stock and verify replacements. Want me to draft the customer notice + pickup checklist?"
+        body = f"{name}, pharmacy supply alert: hold {molecule} batches {batches or 'listed in the trigger'} from {_text(payload.get('manufacturer'), 'the named manufacturer')}.{total_bit} Verify replacements before dispensing. Reply YES and I’ll draft the customer notice and pickup checklist."
         cta = "binary_yes_no"
         fact = f"{molecule} batch alert {batches or 'from the trigger'}"
     elif kind in {"gbp_unverified", "profile_unverified"}:
         path = _text(payload.get("verification_path"), "the supplied verification path")
         uplift = payload.get("estimated_uplift_pct")
         uplift_bit = f" The supplied estimate is {_pct(uplift)}." if uplift is not None else ""
-        body = f"{name}, your Google Business Profile is still unverified; the available route is {path}.{uplift_bit} Want me to walk you through the next verification step?"
-        cta = "open_ended"
+        body = f"{name}, your Google Business Profile is still unverified; the available route is {path}.{uplift_bit} Reply YES and I’ll walk you through the next verification step."
+        cta = "binary_yes_no"
         fact = f"verified={merchant.get('identity', {}).get('verified')} and path {path}"
     elif kind in {"cde_opportunity", "webinar"}:
         item = _digest_item(category, trigger)
@@ -400,30 +437,37 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
             detail += f"{credits} credits; "
         if fee:
             detail += fee
-        body = f"{name}, {title}{(' (' + detail.rstrip('; ') + ')' if detail else '')}. Want me to save the registration details for you?"
-        cta = "open_ended"
+        body = f"{name}, {title}{(' (' + detail.rstrip('; ') + ')' if detail else '')}. Reply YES and I’ll save the registration details for you."
+        cta = "binary_yes_no"
         fact = f"opportunity title {title}"
     elif kind in {"competitor_opened", "competitor_alert"}:
         competitor = _text(payload.get("competitor_name"), "a nearby competitor")
         distance = _text(payload.get("distance_km"))
         their_offer = _text(payload.get("their_offer"))
         offer_bit = f" Their listed offer is {their_offer}." if their_offer else ""
-        body = f"{name}, {competitor} opened {distance + ' km' if distance else 'nearby'}.{offer_bit} This is a useful prompt to sharpen your own listing, not to copy theirs. Want me to draft a comparison-led GBP update using your live offer?"
-        cta = "open_ended"
+        own_offer = _offer_text(merchant)
+        own_bit = f" Your live offer is {own_offer}." if own_offer else " You do not currently have an active offer on file."
+        body = f"{name}, {competitor} opened {distance + ' km' if distance else 'nearby'}.{offer_bit}{own_bit} This is a prompt to sharpen your own listing, not copy theirs. Reply YES and I’ll draft the comparison-led GBP update."
+        cta = "binary_yes_no"
         fact = f"competitor {competitor} at {distance or 'the supplied distance'}"
     elif kind in {"curious_ask_due", "scheduled_recurring"}:
         last = _history_last(merchant)
         recent = _compact(_text(last.get("body")))
         recent_bit = f" Your last Vera note was about: {recent}." if recent else ""
-        body = f"Hi {name}! Quick operator question: what service or product has been asked for most this week at {business}?{recent_bit} Reply with just the name and I’ll turn it into one useful customer-ready draft."
+        body = f"Hi {name}! Quick operator question for {business} in {_locality(merchant) or 'your locality'}: what service or product has been asked for most this week?{recent_bit} Reply with just the name and I’ll turn it into one useful customer-ready draft."
         cta = "open_ended"
         fact = "the scheduled curiosity prompt plus the merchant identity"
     elif kind in {"winback_eligible", "dormant_with_vera"}:
         days = payload.get("days_since_last_merchant_message", payload.get("days_since_expiry"))
-        lapsed = (merchant.get("customer_aggregate") or {}).get("lapsed_90d_plus", (merchant.get("customer_aggregate") or {}).get("lapsed_180d_plus"))
+        aggregate = merchant.get("customer_aggregate") or {}
+        lapsed = aggregate.get("lapsed_90d_plus", aggregate.get("lapsed_180d_plus"))
+        dip = payload.get("perf_dip_pct")
+        dip_bit = f" Listing performance is also {_pct(dip)}." if dip is not None else ""
+        offer = _offer_text(merchant)
+        offer_bit = f" Anchor it to {offer}." if offer else " Reply with the service you want to bring back first."
         lapsed_bit = f" There are {_number(lapsed)} lapsed customers in the supplied aggregate." if lapsed is not None else ""
-        body = f"{name}, it has been {days if days is not None else 'a while'} days since the last useful touch.{lapsed_bit} Rather than send a generic promo, want me to draft one win-back message around a real service you currently offer?"
-        cta = "open_ended"
+        body = f"{name}, it has been {days if days is not None else 'a while'} days since the last useful touch.{lapsed_bit}{dip_bit} Rather than send a generic promo, reply YES and I’ll draft one win-back message.{offer_bit}"
+        cta = "binary_yes_no"
         fact = f"{days if days is not None else 'recent'}-day inactivity signal"
     else:
         # Generic fallback still names the trigger and one payload fact, making
