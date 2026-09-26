@@ -48,6 +48,16 @@ def _merchant_name(merchant: dict[str, Any]) -> str:
     return _text((merchant.get("identity") or {}).get("name"), "your business")
 
 
+def _merchant_sender(merchant: dict[str, Any], with_locality: bool = False) -> str:
+    identity = merchant.get("identity") or {}
+    owner = _text(identity.get("owner_first_name"))
+    name = _merchant_name(merchant)
+    sender = f"{owner} from {name}" if owner else name
+    if with_locality and _locality(merchant):
+        sender += f" in {_locality(merchant)}"
+    return sender
+
+
 def _locality(merchant: dict[str, Any]) -> str:
     identity = merchant.get("identity") or {}
     locality = _text(identity.get("locality"))
@@ -75,6 +85,29 @@ def _trend_label(value: Any) -> str:
     return re.sub(r"\s+", " ", raw).strip()
 
 
+def _readable_label(value: Any) -> str:
+    """Render machine labels such as ``skin_prep_program_30day`` naturally."""
+    raw = _trend_label(value)
+    raw = re.sub(r"(\d+)(day|days|month|months|week|weeks)\b", r"\1-\2", raw, flags=re.I)
+    replacements = {
+        "30-day skin prep program": "30-day skin-prep program",
+        "7-day skin prep program": "7-day skin-prep program",
+        "skin prep program 30-day": "30-day skin-prep program",
+        "skin prep program 7-day": "7-day skin-prep program",
+    }
+    return replacements.get(raw, raw)
+
+
+def _sentence_fragment(value: Any) -> str:
+    """Keep a quoted context fragment from creating doubled punctuation."""
+    return re.sub(r"[.!?]+$", "", _text(value).strip())
+
+
+def _lower_first(value: Any) -> str:
+    text = _sentence_fragment(value)
+    return text[:1].lower() + text[1:] if text else ""
+
+
 def _category_slug(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[str, Any]) -> str:
     return _text(category.get("slug") or merchant.get("category_slug") or (trigger.get("payload") or {}).get("category"), "business")
 
@@ -93,6 +126,7 @@ def _offer_text(merchant: dict[str, Any], preferred: tuple[str, ...] = ()) -> st
             title = _text(offer.get("title"))
             if any(word in title.lower() for word in preferred):
                 return title
+        return ""
     return _text(offers[0].get("title"))
 
 
@@ -102,6 +136,17 @@ def _pct(value: Any) -> str:
     except (TypeError, ValueError):
         return _text(value)
     return f"{n * 100:+.0f}%"
+
+
+def _percentage(value: Any) -> str:
+    """Format a share or rate for prose without a misleading plus sign."""
+    try:
+        n = float(value) * 100
+    except (TypeError, ValueError):
+        return _text(value)
+    if n.is_integer():
+        return f"{int(n)}%"
+    return f"{n:.1f}".rstrip("0").rstrip(".") + "%"
 
 
 def _number(value: Any) -> str:
@@ -147,12 +192,41 @@ def _datetime_label(value: Any) -> str:
 
 def _digest_item(category: dict[str, Any], trigger: dict[str, Any]) -> dict[str, Any]:
     payload = trigger.get("payload") or {}
-    wanted = payload.get("top_item_id") or payload.get("digest_item_id") or payload.get("item_id")
+    inline = payload.get("top_item") or payload.get("digest_item")
+    if isinstance(inline, dict):
+        return inline
+    wanted = (
+        payload.get("top_item_id")
+        or payload.get("digest_item_id")
+        or payload.get("item_id")
+        or payload.get("alert_id")
+    )
     digest = category.get("digest") or []
     if wanted:
         for item in digest:
             if item.get("id") == wanted:
                 return item
+    kind = _text(trigger.get("kind")).lower()
+    kind_map = {
+        "research_digest": {"research"},
+        "research_digest_release": {"research"},
+        "category_research_digest_release": {"research"},
+        "regulation_change": {"compliance"},
+        "compliance_alert": {"compliance"},
+        "compliance": {"compliance"},
+        "supply_alert": {"alert", "supply"},
+        "supply_recall": {"alert", "supply"},
+        "cde_opportunity": {"cde"},
+        "webinar": {"cde"},
+        "category_seasonal": {"seasonal"},
+        "seasonal_perf_dip": {"seasonal"},
+        "ipl_match_today": {"seasonal"},
+        "match_today": {"seasonal"},
+    }
+    wanted_kinds = kind_map.get(kind, set())
+    for item in digest:
+        if _text(item.get("kind")).lower() in wanted_kinds:
+            return item
     return digest[0] if digest else {}
 
 
@@ -169,6 +243,67 @@ def _category_language(merchant: dict[str, Any], customer: Optional[dict[str, An
         return _text((customer.get("identity") or {}).get("language_pref"), "english").lower()
     langs = (merchant.get("identity") or {}).get("languages") or []
     return ",".join(_text(x).lower() for x in langs)
+
+
+def _active_offer_list(merchant: dict[str, Any]) -> list[str]:
+    return [_text(o.get("title")) for o in _active_offers(merchant) if _text(o.get("title"))]
+
+
+def _preferred_slot_label(customer: dict[str, Any]) -> str:
+    preference = _text((customer.get("preferences") or {}).get("preferred_slots"))
+    labels = {
+        "weekday_evening": "a weekday evening",
+        "weekday_after_3pm": "a weekday after 3pm",
+        "saturday_morning": "Saturday morning",
+        "saturday_afternoon": "Saturday afternoon",
+        "saturday": "Saturday",
+        "weekday_7am": "a weekday 7am slot",
+        "morning_6am": "a 6am morning slot",
+        "morning_delivery": "a morning delivery",
+        "fri_sat_night": "a Friday/Saturday night",
+    }
+    return labels.get(preference, preference.replace("_", " ") if preference else "a convenient time")
+
+
+def _change_phrase(value: Any, direction: str = "") -> str:
+    try:
+        pct = float(value) * 100
+        amount = abs(pct)
+        if amount.is_integer():
+            amount_text = str(int(amount))
+        else:
+            amount_text = f"{amount:.1f}".rstrip("0").rstrip(".")
+        if direction == "up" or pct > 0:
+            return f"up {amount_text}%"
+        if direction == "down" or pct < 0:
+            return f"down {amount_text}%"
+        return "flat"
+    except (TypeError, ValueError):
+        return _text(value)
+
+
+def _metric_subject(metric: Any) -> str:
+    """Use grammatically correct, merchant-readable metric nouns."""
+    labels = {
+        "calls": "call volume",
+        "views": "views",
+        "directions": "direction requests",
+        "ctr": "CTR",
+        "leads": "leads",
+        "review_count": "reviews",
+    }
+    raw = _text(metric, "performance").replace("_", " ")
+    return labels.get(_text(metric), raw)
+
+
+def _friendly_cta(cta: str) -> str:
+    return {
+        "binary_yes_no": "a single YES/NO confirmation",
+        "binary_confirm_cancel": "a single confirmation",
+        "multi_choice_slot": "one slot choice or another preferred time",
+        "open_ended": "one focused reply",
+        "none": "no follow-up action",
+    }.get(cta, "one focused reply")
 
 
 def _customer_can_contact(customer: Optional[dict[str, Any]]) -> bool:
@@ -210,7 +345,11 @@ def _merchant_greeting(merchant: dict[str, Any]) -> str:
 
 def _rationale(kind: str, category: dict[str, Any], merchant: dict[str, Any], customer: Optional[dict[str, Any]], fact: str, cta: str) -> str:
     audience = "customer-facing via the merchant" if customer else "merchant-facing via Vera"
-    return f"{kind.replace('_', ' ').capitalize()} message for {_category_slug(category, merchant, {})}; {audience}. Anchored on {fact}. One next step: {cta}."
+    return (
+        f"{kind.replace('_', ' ').capitalize()} for {_category_slug(category, merchant, {})}; "
+        f"{audience}. Chosen because {fact}. The message uses {_friendly_cta(cta)} "
+        "and does not add facts outside the supplied context."
+    )
 
 
 def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[str, Any], customer: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -240,43 +379,64 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
                 "suppression_key": suppression,
                 "rationale": "Customer outreach suppressed because an explicit opt-in scope was not present.",
             }
-        if kind in {"recall_due", "appointment_tomorrow"}:
+        if kind == "recall_due":
             slots = _customer_slot_text(payload)
             offer = _offer_text(merchant, ("clean", "check", "consult", "appointment"))
             last_visit = _date_label((customer.get("relationship") or {}).get("last_visit"))
             due = _date_label(payload.get("due_date"))
             service = _text(payload.get("service_due"), "your next visit").replace("_", " ")
+            service = re.sub(r"^(\d+) month", r"\1-month", service)
             if customer_lang.startswith("hi"):
-                lead = f"Hi {cname} 👋 {business} here. Aapki {service} recall window"
+                lead = f"Hi {cname} 👋 {business} here. Aapki {service} recall"
                 slot_line = f"Apke liye slot{'s' if len(slots.split(' or ')) > 1 else ''}: {slots}." if slots else "Aap apna convenient time bata sakte hain."
             else:
-                lead = f"Hi {cname} 👋 {business} here. Your {service} recall window"
+                lead = f"Hi {cname} 👋 {business} here. Your {service} recall"
                 slot_line = f"I have {slots} available." if slots else "Tell us a weekday time that works."
-            timing = f" opened{(' for ' + _date_label(due)) if due else ''}"
+            timing = f" is due{(' on ' + _date_label(due)) if due else ''}"
             history_bit = f" It has been since {last_visit}." if last_visit else ""
             offer_bit = f" {offer}." if offer else ""
             body = f"{lead}{timing}.{history_bit}{offer_bit} {slot_line} Reply with the slot that works, or share another time."
             cta = "multi_choice_slot" if slots else "open_ended"
             fact = f"{kind} trigger and {slots or 'available timing'}"
+        elif kind == "appointment_tomorrow":
+            service = _text(payload.get("service"), _text(payload.get("appointment_type"), "your appointment")).replace("_", " ")
+            appointment_time = _datetime_label(payload.get("appointment_time_iso") or payload.get("start_time_iso"))
+            location = _locality(merchant)
+            body = f"Hi {cname}, {_merchant_name(merchant)} here. Reminder: your {service} is tomorrow{(' at ' + appointment_time) if appointment_time else ''}{(' in ' + location) if location else ''}. Reply YES to confirm, or tell us if you need a different time."
+            cta = "binary_yes_no"
+            fact = f"appointment tomorrow for {service}"
         elif kind in {"customer_lapsed_hard", "customer_lapsed_soft", "winback_customer", "winback"}:
             days = payload.get("days_since_last_visit")
-            focus = _text(payload.get("previous_focus"), "your earlier goal")
+            focus = _readable_label(payload.get("previous_focus")) or "your earlier goal"
             offer = _offer_text(merchant, ("trial", "month", "class", "membership"))
             timing = f"about {days} days" if days is not None else "a little while"
+            membership_months = payload.get("previous_membership_months")
             no_shame = "No pressure — returning should fit your routine."
             offer_bit = f" We have {offer}." if offer else ""
-            body = f"Hi {cname} 👋 {_merchant_name(merchant)} here. It’s been {timing}; {no_shame} I remember your focus on {focus}.{offer_bit} Want me to hold one low-commitment slot for you?"
+            history_bit = f" You were with us for {membership_months} months." if membership_months is not None else ""
+            slot_bit = f" I can look for {_preferred_slot_label(customer)}." if (customer.get("preferences") or {}).get("preferred_slots") else ""
+            body = f"Hi {cname} 👋 {_merchant_sender(merchant)} here. It’s been {timing}; {no_shame} I remember your focus on {focus}.{history_bit}{offer_bit}{slot_bit} Reply YES and I’ll hold a low-commitment return option — no auto-charge."
             cta = "binary_yes_no"
             fact = f"{days or 'recent'} days since the last visit and {focus} goal"
         elif kind in {"trial_followup", "wedding_package_followup", "bridal_followup"}:
             slots = _customer_slot_text(payload)
             wedding = _date_label(payload.get("wedding_date"))
+            trial_date = _date_label(payload.get("trial_date") or payload.get("trial_completed"))
+            days_to_wedding = payload.get("days_to_wedding")
             offer = _offer_text(merchant, ("bridal", "skin", "trial", "package"))
-            service = "bridal follow-up" if "wedding" in kind or "bridal" in kind else "your trial"
+            service = "your bridal trial" if "wedding" in kind or "bridal" in kind else "your trial"
             offer_bit = f" {offer} is available." if offer else ""
-            date_bit = f" Your wedding is {wedding}." if wedding else ""
-            slot_bit = f" I can hold {slots}." if slots else ""
-            body = f"Hi {cname} 💍 {_merchant_name(merchant)} here — following up on {service}.{date_bit}{offer_bit}{slot_bit} Shall I reserve the next step?"
+            trial_bit = f" Your trial was on {trial_date}." if trial_date else ""
+            days_bit = f" ({days_to_wedding} days away)" if days_to_wedding is not None else ""
+            slot_bit = f" The next option is {slots}." if slots else f" I can look for {_preferred_slot_label(customer)}."
+            if "wedding" in kind or "bridal" in kind:
+                date_bit = f" Your wedding is {wedding}{days_bit}." if wedding else ""
+                next_step = _readable_label(payload.get("next_step_window_open"))
+                next_step_bit = f" The next step window is {next_step}." if next_step else ""
+                body = f"Hi {cname} 💍 {_merchant_sender(merchant, with_locality=True)} here — following up on {service}.{trial_bit}{date_bit}{offer_bit}{next_step_bit}{slot_bit} Reply YES and I’ll reserve the next step."
+            else:
+                trial_bit = f" Your trial was on {trial_date}." if trial_date else ""
+                body = f"Hi {cname} 👋 {_merchant_sender(merchant)} here — following up on {service}.{trial_bit}{slot_bit} Reply YES and I’ll hold the next session."
             cta = "binary_yes_no"
             fact = f"{kind} context" + (f" and {wedding} wedding date" if wedding else "")
         elif kind in {"chronic_refill_due", "refill_due"}:
@@ -286,9 +446,31 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
             pref = customer.get("preferences") or {}
             delivery = "your saved delivery address" if pref.get("delivery_address") == "saved" or payload.get("delivery_address_saved") else "pickup or delivery"
             greeting = "Namaste" if customer_lang.startswith("hi") else "Hi"
-            body = f"{greeting} {cname}, {_merchant_name(merchant)} here. Your refill list: {molecule_text or 'the medicines in your last order'}; stock is expected to run out{(' on ' + runout) if runout else ' soon'}. We can arrange {delivery}. Shall I prepare it for your confirmation?"
-            cta = "binary_yes_no"
+            via_son = "via_son" in _text(pref.get("channel")).lower()
+            recipient = f"{_text(cname).replace('Mr. ', '').replace('Mrs. ', '')} ji ki" if via_son and customer_lang.startswith("hi") else f"{cname},"
+            sender = _merchant_sender(merchant, with_locality=True)
+            offers = _active_offer_list(merchant)
+            delivery_offer = next((o for o in offers if "delivery" in o.lower()), "")
+            senior_offer = next((o for o in offers if "senior" in o.lower()), "")
+            offer_bits = []
+            if delivery_offer:
+                offer_bits.append(delivery_offer)
+            if (customer.get("identity") or {}).get("senior_citizen") or "65-75" in _text((customer.get("identity") or {}).get("age_band")):
+                if senior_offer:
+                    offer_bits.append(senior_offer)
+            offer_line = f" {'; '.join(offer_bits)} applies." if offer_bits else ""
+            if via_son and customer_lang.startswith("hi"):
+                body = f"{greeting} — {sender}. {recipient} 3 monthly medicines ({molecule_text or 'the medicines in the last order'}) ka stock is expected to run out{(' on ' + runout) if runout else ' soon'}. We can arrange {delivery}.{offer_line} Reply CONFIRM and we’ll prepare it for your approval."
+            else:
+                body = f"{greeting} {cname}, {sender} here. Your refill list: {molecule_text or 'the medicines in your last order'}; stock is expected to run out{(' on ' + runout) if runout else ' soon'}. We can arrange {delivery}.{offer_line} Reply CONFIRM and we’ll prepare it for your approval."
+            cta = "binary_confirm_cancel"
             fact = f"refill medicines {molecule_text or 'from the customer record'} and run-out date {runout or 'in the trigger'}"
+        elif kind == "unplanned_slot_open":
+            slots = _customer_slot_text(payload)
+            service = _text(payload.get("service"), _text(payload.get("slot_type"), "an available appointment"))
+            body = f"Hi {cname} 👋 {_merchant_name(merchant)} here. A {service.replace('_', ' ')} slot opened up{(' at ' + slots) if slots else ''}. It matches {_preferred_slot_label(customer)}. Reply YES and I’ll hold it for you."
+            cta = "binary_yes_no"
+            fact = f"unplanned slot {slots or 'from the trigger'}"
         else:
             # Safe generic customer fallback: only mention fields explicitly sent.
             body = f"Hi {cname}, {_merchant_name(merchant)} here. I have an update related to your account. Would you like me to share the next step?"
@@ -303,16 +485,21 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         title = _text(item.get("title"), "a new category item")
         source = _text(item.get("source"))
         summary = _text(item.get("summary"))
-        parts = [f"{name}, {source + ' ' if source else ''}has a new item: {title}."]
+        parts = [f"{name}, a new category item is worth your attention: {title}."]
+        if source:
+            parts.append(f"Source: {source}.")
         if item.get("trial_n") is not None:
-            parts.append(f"It covers {_number(item['trial_n'])} participants.")
+            parts.append(f"The study covers {_number(item['trial_n'])} participants.")
         if summary:
             parts.append(_compact(summary, 200))
         signals = " ".join(_text(s) for s in (merchant.get("signals") or []))
         high_risk = (merchant.get("customer_aggregate") or {}).get("high_risk_adult_count")
         if "high_risk" in signals.lower() or high_risk:
-            parts.append(f"It is especially relevant to the { _number(high_risk) if high_risk else 'high-risk'} adult patients in your records.")
-        parts.append("Reply YES and I’ll turn this item into one patient-ready post.")
+            parts.append(f"It is especially relevant to the {_number(high_risk) if high_risk else 'high-risk'} high-risk adult patients in your records.")
+        actionable = _text(item.get("actionable"))
+        if actionable:
+            parts.append(f"The practical next step is to {actionable.lower().rstrip('.')}.")
+        parts.append("Reply YES and I’ll turn this into one patient-ready post using your clinic’s voice.")
         body = " ".join(parts)
         cta = "binary_yes_no"
         fact = f"digest headline{(' and source ' + source) if source else ''}"
@@ -324,36 +511,56 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         summary = _text(item.get("summary"))
         action = _text(item.get("actionable"), "review the affected workflow")
         body = f"{name}, compliance check: {title}."
+        if source:
+            body += f" Source: {source}."
         if deadline:
             body += f" The deadline is {deadline}."
         if summary:
             body += f" {_compact(summary, 220)}"
-        body += f" Suggested next step for this practice: {action}. Reply YES and I’ll turn it into a short audit checklist."
+        body += f" Suggested next step for this practice: {action}. Reply YES and I’ll turn the circular into a short audit checklist."
         cta = "binary_yes_no"
         fact = f"compliance headline and {source or 'provided'} source"
     elif kind in {"perf_dip", "seasonal_perf_dip"}:
         metric, change, current = _metric_snapshot(merchant, payload)
+        metric_subject = _metric_subject(payload.get("metric"))
         peer = (category.get("peer_stats") or {}).get(f"avg_{payload.get('metric')}_30d")
         baseline = payload.get("vs_baseline")
-        expected = " The trigger marks this as seasonal, so I would not overreact." if payload.get("is_expected_seasonal") else ""
+        delta = payload.get("delta_pct")
+        change_phrase = _change_phrase(delta if delta is not None else (merchant.get("performance") or {}).get("delta_7d", {}).get(f"{payload.get('metric')}_pct"), "down")
+        expected = " This is marked as seasonal, so I would protect retention rather than panic-spend on acquisition." if payload.get("is_expected_seasonal") else ""
         peer_bit = f" Peer average is {_number(peer)}." if peer is not None else ""
-        current_bit = f" Current {metric}: {current}." if current else ""
-        baseline_bit = f" The supplied baseline is {_number(baseline)}." if baseline is not None else ""
-        body = f"{name}, your {metric} is {change or 'down'} over {payload.get('window', 'the current window')}.{current_bit}{baseline_bit}{peer_bit}{expected} I recommend {_category_action(slug)}. Reply YES and I’ll draft it."
+        current_bit = f" The latest merchant snapshot records {current}." if current else ""
+        baseline_bit = f" The trigger baseline is {_number(baseline)}." if baseline is not None else ""
+        seasonal_item = _digest_item(category, trigger) if kind == "seasonal_perf_dip" else {}
+        seasonal_bit = f" Category guidance: {_compact(_text(seasonal_item.get('actionable')), 160)}." if seasonal_item.get("actionable") else ""
+        aggregate = merchant.get("customer_aggregate") or {}
+        active_members = aggregate.get("total_active_members", aggregate.get("active_members"))
+        member_bit = f" Your current base is {_number(active_members)} active members." if active_members is not None else ""
+        body = f"{name}, the trigger flags {metric_subject} {change_phrase} over {payload.get('window', 'the current window')}.{current_bit}{baseline_bit}{peer_bit}{expected}{member_bit}{seasonal_bit} I recommend {_category_action(slug)}. Reply YES and I’ll draft the first step."
         cta = "binary_yes_no"
-        fact = f"{metric} change {change or 'from the trigger'} and baseline {baseline or 'not supplied'}"
+        fact = f"{metric} change {change_phrase} and baseline {baseline or 'not supplied'}"
     elif kind in {"perf_spike", "milestone_reached"}:
         metric, change, current = _metric_snapshot(merchant, payload)
+        metric_subject = _metric_subject(payload.get("metric"))
         driver = _text(payload.get("likely_driver"), "the recent activity")
         milestone = payload.get("milestone_value")
         if kind == "milestone_reached" or milestone is not None:
             value = _number(payload.get("value_now"))
-            body = f"{name}, you are at {value or 'the latest'} {metric}; the next milestone is {milestone or 'in view'}. Nice moment to make that proof visible in your listing. Reply YES and I’ll draft the GBP post."
+            distance = ""
+            try:
+                distance = f" That is {_number(float(milestone) - float(payload.get('value_now')))} away." if payload.get("value_now") is not None and milestone is not None else ""
+            except (TypeError, ValueError):
+                pass
+            body = f"{name}, you are at {value or 'the latest'} {metric_subject}; the next milestone is {milestone or 'in view'}.{distance} Nice moment to make that proof visible in your listing. Reply YES and I’ll draft the GBP post."
             fact = f"milestone value {value or milestone}"
         else:
             baseline = payload.get("vs_baseline")
             baseline_bit = f" from the supplied baseline of {_number(baseline)}" if baseline is not None else ""
-            body = f"{name}, {metric} is up {change or 'in the latest window'}{baseline_bit}; the likely driver is {driver.replace('_', ' ')}. Reply YES and I’ll turn that winning signal into {_category_action(slug, positive=True)}."
+            change_phrase = _change_phrase(payload.get("delta_pct"), "up")
+            current_bit = ""
+            if current and (baseline is None or current != _number(baseline)):
+                current_bit = f" The latest snapshot is {_number(current)}."
+            body = f"{name}, {metric_subject} is {change_phrase}{baseline_bit} in {payload.get('window', 'the latest window')}.{current_bit} The likely driver is {driver.replace('_', ' ')}. Reply YES and I’ll turn that signal into {_category_action(slug, positive=True)}."
             fact = f"{metric} movement {change or 'from the trigger'}"
         cta = "binary_yes_no"
     elif kind in {"renewal_due"}:
@@ -367,17 +574,24 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
     elif kind in {"festival_upcoming", "festival", "category_seasonal"}:
         if kind == "category_seasonal":
             trends = payload.get("trends") or []
-            trend_bits = ", ".join(_trend_label(item) for item in trends[:2])
+            trend_bits = ", ".join(_trend_label(item) for item in trends[:3])
             trend = trend_bits or "the supplied seasonal shift"
-            body = f"{name}, the seasonal signal is {trend}. For your pharmacy in {_locality(merchant) or 'your locality'}, adjust the shelf/content mix before reaching for a generic discount. Reply YES and I’ll draft the precise update."
+            item = _digest_item(category, trigger)
+            action = _text(item.get("actionable"))
+            action_bit = f" the category guidance is to {_lower_first(action)}" if action else " move the strongest seasonal lines into visibility"
+            offer = _offer_text(merchant, ("delivery", "health", "senior"))
+            offer_bit = f" Keep {offer} as the only offer anchor." if offer else ""
+            body = f"{name}, the seasonal signal is {trend}. For your pharmacy in {_locality(merchant) or 'your locality'},{action_bit}.{offer_bit} Reply YES and I’ll draft the precise shelf/content update."
             fact = f"seasonal signal {trend}"
         else:
             festival = _text(payload.get("festival"), "the upcoming festival")
             date = _date_label(payload.get("date"))
+            days_until = payload.get("days_until")
             offer = _offer_text(merchant)
             offer_bit = f" Your live offer is {offer}." if offer else ""
             category_angle = {"salons": "festive appointment", "restaurants": "local dining", "pharmacies": "seasonal essentials"}.get(slug, "timely local")
-            body = f"{name}, {festival} is on {date or 'the date in the trigger'}{'.' if date else ''}{offer_bit} I recommend a {category_angle} angle for {_locality(merchant) or 'your locality'}. Reply YES and I’ll draft the post."
+            days_bit = f" That is {days_until} days away." if days_until is not None else ""
+            body = f"{name}, {festival} is on {date or 'the date in the trigger'}{'.' if date else ''}{days_bit}{offer_bit} I recommend a {category_angle} angle for {_locality(merchant) or 'your locality'}. Reply YES and I’ll draft the post."
             fact = f"{festival} date {date or 'from the trigger'}"
         cta = "binary_yes_no"
     elif kind in {"ipl_match_today", "match_today"}:
@@ -386,9 +600,19 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         when = _datetime_label(payload.get("match_time_iso"))
         offer = _offer_text(merchant, ("pizza", "combo", "delivery"))
         channel = "delivery-first" if payload.get("is_weeknight") is False else "match-night"
-        offer_bit = f" Use your active {offer} as the anchor." if offer else ""
+        offer_bit = f" Your active offer is {offer}, but keep its stated terms." if offer else " No active offer is on file, so avoid inventing a match discount."
         venue_bit = f" at {venue}" if venue else ""
-        body = f"Quick heads-up {name}: {match}{venue_bit} is scheduled for {when or 'the supplied time'}. I would test a {channel} angle for {_locality(merchant) or 'your locality'} rather than a generic promo.{offer_bit} Reply YES and I’ll draft the customer-facing copy."
+        aggregate = merchant.get("customer_aggregate") or {}
+        delivery = aggregate.get("delivery_orders_30d")
+        dine_in = aggregate.get("dine_in_orders_30d")
+        order_bit = f" Your last 30 days show {_number(delivery)} delivery orders vs {_number(dine_in)} dine-in orders." if delivery is not None and dine_in is not None else ""
+        weekend_bit = " It is not a weeknight, so I would not label it a match-night discount." if payload.get("is_weeknight") is False else ""
+        item = _digest_item(category, trigger)
+        digest_summary = _compact(_text(item.get("summary")), 230)
+        digest_action = _text(item.get("actionable"))
+        digest_bit = f" Category signal: {_sentence_fragment(digest_summary)}." if digest_summary else ""
+        action_bit = f" Guidance: {_sentence_fragment(digest_action)}." if digest_action else ""
+        body = f"Quick heads-up {name}: {match}{venue_bit} is scheduled for {when or 'the supplied time'}.{digest_bit}{action_bit}{order_bit}{weekend_bit} I would test a {channel} angle for {_locality(merchant) or 'your locality'} rather than a generic promo.{offer_bit} Reply YES and I’ll draft the customer-facing copy."
         cta = "binary_yes_no"
         fact = f"match {match} and time {when or 'from the trigger'}"
     elif kind in {"review_theme_emerged", "review_theme"}:
@@ -396,7 +620,12 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         count = payload.get("occurrences_30d")
         quote = _text(payload.get("common_quote"))
         quote_bit = f' One customer wrote, "{_compact(quote, 120)}".' if quote else ""
-        body = f"{name}, {theme.replace('_', ' ')} has appeared {count or 'multiple times'} in the last 30 days and is {payload.get('trend', 'worth addressing')}.{quote_bit} Reply YES and I’ll draft one customer reply plus the operational fix."
+        order_bit = ""
+        if slug == "restaurants":
+            delivery_orders = (merchant.get("customer_aggregate") or {}).get("delivery_orders_30d")
+            if delivery_orders is not None:
+                order_bit = f" That is against {_number(delivery_orders)} delivery orders in the same period."
+        body = f"{name}, {theme.replace('_', ' ')} has appeared {count or 'multiple times'} times in the last 30 days and is {payload.get('trend', 'worth addressing')}.{quote_bit}{order_bit} Reply YES and I’ll draft one customer reply plus the operational fix."
         cta = "binary_yes_no"
         fact = f"{count or 'repeated'} reviews mentioning {theme}"
     elif kind in {"active_planning_intent", "planning_intent"}:
@@ -407,7 +636,12 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         offer = _offer_text(merchant)
         offer_bit = f" Your live offer is {offer}." if offer else ""
         prior_bit = f" The earlier plan in this thread was: {_compact(prior_vera.get('body'), 150)}." if prior_vera else ""
-        body = f"{name}, picking up your note on {topic}: “{_compact(last_msg, 180)}”{offer_bit}{prior_bit} Reply YES and I’ll turn the existing details into one reviewable draft."
+        aggregate = merchant.get("customer_aggregate") or {}
+        delivery_share = aggregate.get("delivery_share_pct")
+        volume_bit = ""
+        if slug == "restaurants" and delivery_share is not None:
+            volume_bit = f" Your supplied mix is {_percentage(delivery_share)} delivery, so I’ll keep the draft delivery-aware."
+        body = f"{name}, picking up your note on {topic}: “{_compact(last_msg, 180)}”{offer_bit}{volume_bit}{prior_bit} Reply YES and I’ll turn only the existing details into one reviewable draft; I’ll leave new pricing or delivery promises for your approval."
         cta = "binary_yes_no"
         fact = f"the merchant's stated planning intent: {topic}"
     elif kind in {"supply_alert", "supply_recall"}:
@@ -416,14 +650,23 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         aggregate = merchant.get("customer_aggregate") or {}
         total = aggregate.get("chronic_rx_customers", aggregate.get("chronic_rx_count"))
         total_bit = f" You have {total} chronic-Rx customers in the supplied aggregate." if total is not None else ""
-        body = f"{name}, pharmacy supply alert: hold {molecule} batches {batches or 'listed in the trigger'} from {_text(payload.get('manufacturer'), 'the named manufacturer')}.{total_bit} Verify replacements before dispensing. Reply YES and I’ll draft the customer notice and pickup checklist."
+        item = _digest_item(category, trigger)
+        source = _text(item.get("source"))
+        summary = _compact(_text(item.get("summary")), 240)
+        source_bit = f" Source: {source}." if source else ""
+        summary_bit = f" {summary}" if summary else ""
+        affected = aggregate.get("affected_customers") or aggregate.get("affected_recall_customers") or payload.get("affected_customer_count")
+        affected_bit = f" The supplied affected-customer count is {_number(affected)}." if affected is not None else ""
+        body = f"{name}, pharmacy supply alert: hold {molecule} batches {batches or 'listed in the trigger'} from {_text(payload.get('manufacturer'), 'the named manufacturer')}.{source_bit}{summary_bit}{total_bit}{affected_bit} Verify replacements before dispensing. Reply YES and I’ll draft the customer notice and pickup workflow."
         cta = "binary_yes_no"
         fact = f"{molecule} batch alert {batches or 'from the trigger'}"
     elif kind in {"gbp_unverified", "profile_unverified"}:
         path = _text(payload.get("verification_path"), "the supplied verification path")
         uplift = payload.get("estimated_uplift_pct")
         uplift_bit = f" The supplied estimate is {_pct(uplift)}." if uplift is not None else ""
-        body = f"{name}, your Google Business Profile is still unverified; the available route is {path}.{uplift_bit} Reply YES and I’ll walk you through the next verification step."
+        performance = merchant.get("performance") or {}
+        stats = f" Your current listing snapshot is {_number(performance.get('views'))} views and {_number(performance.get('calls'))} calls." if performance.get("views") is not None and performance.get("calls") is not None else ""
+        body = f"{name}, your Google Business Profile in {_locality(merchant) or 'your locality'} is still unverified; the available route is {_trend_label(path)}.{uplift_bit}{stats} Reply YES and I’ll walk you through the next verification step."
         cta = "binary_yes_no"
         fact = f"verified={merchant.get('identity', {}).get('verified')} and path {path}"
     elif kind in {"cde_opportunity", "webinar"}:
@@ -432,29 +675,65 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         date = _date_label(item.get("date"))
         credits = payload.get("credits", item.get("credits"))
         fee = _text(payload.get("fee"), _text(item.get("fee")))
+        summary = _compact(_text(item.get("summary")), 150)
         detail = f"{date}; " if date else ""
         if credits is not None:
             detail += f"{credits} credits; "
         if fee:
-            detail += fee
-        body = f"{name}, {title}{(' (' + detail.rstrip('; ') + ')' if detail else '')}. Reply YES and I’ll save the registration details for you."
+            detail += _trend_label(fee)
+        summary_bit = f" {summary}." if summary else ""
+        body = f"{name}, {title}{(' (' + detail.rstrip('; ') + ')' if detail else '')}.{summary_bit} Reply YES and I’ll save the registration details for you."
         cta = "binary_yes_no"
         fact = f"opportunity title {title}"
     elif kind in {"competitor_opened", "competitor_alert"}:
         competitor = _text(payload.get("competitor_name"), "a nearby competitor")
         distance = _text(payload.get("distance_km"))
         their_offer = _text(payload.get("their_offer"))
+        opened = _date_label(payload.get("opened_date"))
         offer_bit = f" Their listed offer is {their_offer}." if their_offer else ""
         own_offer = _offer_text(merchant)
         own_bit = f" Your live offer is {own_offer}." if own_offer else " You do not currently have an active offer on file."
-        body = f"{name}, {competitor} opened {distance + ' km' if distance else 'nearby'}.{offer_bit}{own_bit} This is a prompt to sharpen your own listing, not copy theirs. Reply YES and I’ll draft the comparison-led GBP update."
+        date_bit = f" on {opened}" if opened else ""
+        distance_bit = f"{distance} km away" if distance else "nearby"
+        body = f"{name}, {competitor} opened {distance_bit}{date_bit}.{offer_bit}{own_bit} This is a prompt to sharpen your own listing, not copy theirs. Reply YES and I’ll draft the comparison-led GBP update."
         cta = "binary_yes_no"
         fact = f"competitor {competitor} at {distance or 'the supplied distance'}"
+    elif kind in {"category_trend_movement", "trend_movement", "trend_signal"}:
+        query = _text(payload.get("query"), _text(payload.get("trend"), "the category trend"))
+        delta = payload.get("delta_yoy", payload.get("change_pct", payload.get("delta_pct")))
+        segment = _text(payload.get("segment_age"), _text(payload.get("audience")))
+        source = _text(payload.get("source"))
+        delta_bit = f" is {_change_phrase(delta, 'up')}" if delta is not None else " is moving"
+        segment_bit = f" The strongest segment is {segment}." if segment else ""
+        source_bit = f" Source: {source}." if source else ""
+        offer = _offer_text(merchant)
+        offer_bit = f" Your live offer is {offer}." if offer else ""
+        body = f"{name}, searches for {query}{delta_bit}.{segment_bit}{source_bit}{offer_bit} Reply YES and I’ll turn this signal into {_category_action(slug, positive=True)}."
+        cta = "binary_yes_no"
+        fact = f"trend {query} and movement {delta or 'from the trigger'}"
+    elif kind in {"weather_heatwave", "heatwave", "local_news_event", "local_event"}:
+        event = _text(payload.get("event"), _text(payload.get("headline"), _text(payload.get("weather"), kind.replace("_", " "))))
+        temperature = payload.get("temperature_c", payload.get("temp_c"))
+        date = _date_label(payload.get("date"))
+        temperature_bit = f" at {_number(temperature)}°C" if temperature is not None else ""
+        date_bit = f" on {date}" if date else ""
+        action = {
+            "pharmacies": "put ORS, sunscreen, and pharmacist guidance where customers can see them",
+            "restaurants": "lead with delivery availability and a practical menu update",
+            "gyms": "lead with hydration and a safe training-window update",
+            "salons": "lead with a practical hair/skin-care service, not a blanket discount",
+            "dentists": "lead with an evidence-based patient education post",
+        }.get(slug, "make one useful, local listing update")
+        body = f"{name}, local signal: {event}{temperature_bit}{date_bit}. I recommend you {action}. Reply YES and I’ll draft the update using only your live offer and locality."
+        cta = "binary_yes_no"
+        fact = f"external local signal {event}"
     elif kind in {"curious_ask_due", "scheduled_recurring"}:
         last = _history_last(merchant)
         recent = _compact(_text(last.get("body")))
-        recent_bit = f" Your last Vera note was about: {recent}." if recent else ""
-        body = f"Hi {name}! Quick operator question for {business} in {_locality(merchant) or 'your locality'}: what service or product has been asked for most this week?{recent_bit} Reply with just the name and I’ll turn it into one useful customer-ready draft."
+        recent_bit = f" Your last Vera note was about: {_sentence_fragment(recent)}." if recent else ""
+        offers = _active_offer_list(merchant)
+        offer_hint = f" Is it closer to {offers[0]} or {offers[1]}?" if len(offers) >= 2 else (f" Your live offer is {offers[0]}." if offers else "")
+        body = f"Hi {name}! Quick operator question for {business} in {_locality(merchant) or 'your locality'}: what service or product has been asked for most this week?{offer_hint}{recent_bit} Reply with just the name and I’ll turn it into a GBP post plus a short customer reply in 5 minutes."
         cta = "open_ended"
         fact = "the scheduled curiosity prompt plus the merchant identity"
     elif kind in {"winback_eligible", "dormant_with_vera"}:
@@ -462,21 +741,26 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         aggregate = merchant.get("customer_aggregate") or {}
         lapsed = aggregate.get("lapsed_90d_plus", aggregate.get("lapsed_180d_plus"))
         dip = payload.get("perf_dip_pct")
-        dip_bit = f" Listing performance is also {_pct(dip)}." if dip is not None else ""
+        dip_bit = f" Listing performance is also {_change_phrase(dip, 'down')}." if dip is not None else ""
         offer = _offer_text(merchant)
-        offer_bit = f" Anchor it to {offer}." if offer else " Reply with the service you want to bring back first."
+        offer_bit = f" Anchor it to {offer}." if offer else ""
         lapsed_bit = f" There are {_number(lapsed)} lapsed customers in the supplied aggregate." if lapsed is not None else ""
-        body = f"{name}, it has been {days if days is not None else 'a while'} days since the last useful touch.{lapsed_bit}{dip_bit} Rather than send a generic promo, reply YES and I’ll draft one win-back message.{offer_bit}"
-        cta = "binary_yes_no"
+        if offer:
+            body = f"{name}, it has been {days if days is not None else 'a while'} days since the last useful touch.{lapsed_bit}{dip_bit} Rather than send a generic promo, reply YES and I’ll draft one win-back message.{offer_bit}"
+            cta = "binary_yes_no"
+        else:
+            body = f"{name}, it has been {days if days is not None else 'a while'} days since the last useful touch.{lapsed_bit}{dip_bit} What service would you most want to bring back first? Reply with its name and I’ll turn it into one win-back message."
+            cta = "open_ended"
         fact = f"{days if days is not None else 'recent'}-day inactivity signal"
     else:
         # Generic fallback still names the trigger and one payload fact, making
         # novel injected trigger kinds useful without pretending to understand them.
         facts = [(k, v) for k, v in payload.items() if isinstance(v, (str, int, float, bool)) and v not in ("", None)]
-        key, value = facts[0] if facts else ("kind", kind)
-        body = f"{name}, a new {kind.replace('_', ' ')} signal needs attention: {key.replace('_', ' ')} is {_text(value)}. Want me to turn this into one concrete next step?"
-        cta = "open_ended"
-        fact = f"trigger kind {kind} and payload field {key}"
+        shown = facts[:2]
+        fact_text = "; ".join(f"{key.replace('_', ' ')} is {_text(value)}" for key, value in shown) if shown else f"the trigger is {kind.replace('_', ' ')}"
+        body = f"{name}, a new {kind.replace('_', ' ')} signal needs attention: {fact_text}. Reply YES and I’ll turn the supplied signal into one concrete next step."
+        cta = "binary_yes_no"
+        fact = f"trigger kind {kind} and supplied fields {', '.join(key for key, _ in shown) or 'none'}"
 
     # Category voice guardrails are applied as a final deterministic pass.
     taboo = (category.get("voice") or {}).get("vocab_taboo") or (category.get("voice") or {}).get("taboos") or []
@@ -654,13 +938,72 @@ def _is_opt_out(message: str) -> bool:
 
 
 def _is_intent_commitment(message: str) -> bool:
-    text = message.lower()
-    return bool(re.search(r"\b(let's do it|lets do it|go ahead|yes do it|do it|sign me up|i want to join|confirm|proceed|okay send|ok send)\b", text))
+    text = re.sub(r"\s+", " ", message.lower()).strip()
+    return bool(re.search(
+        r"\b(let's do it|lets do it|yes do it|do it|sign me up|i want to join|"
+        r"i want this|go ahead|confirm|proceed|okay send|ok send|send it|"
+        r"yes please|sure|sounds good|kar do|join karna hai|shuru karo)\b",
+        text,
+    ))
 
 
 def _is_off_topic(message: str) -> bool:
     text = message.lower()
     return any(term in text for term in ("gst", "tax filing", "unrelated", "can you also", "politics", "crypto"))
+
+
+def _is_hostile(message: str) -> bool:
+    text = message.lower()
+    return any(term in text for term in ("useless", "spam", "shut up", "idiot", "bakwas", "waste my time", "worst"))
+
+
+def _commitment_response(state: dict[str, Any]) -> tuple[str, str]:
+    trigger = state.get("trigger") or {}
+    merchant = state.get("merchant") or {}
+    customer = state.get("customer")
+    kind = _text(trigger.get("kind"), "request").lower()
+    if customer:
+        cname = _text((customer.get("identity") or {}).get("name"), "the customer")
+        if kind in {"chronic_refill_due", "refill_due"}:
+            return f"Great — I’ll prepare {cname}’s refill list for your confirmation and keep the existing medicines and delivery details unchanged.", "refill preparation accepted"
+        if kind in {"customer_lapsed_hard", "customer_lapsed_soft", "winback_customer", "winback"}:
+            return f"Great — I’ll hold a low-commitment return option for {cname}; no auto-charge and no change to their existing preference.", "customer win-back action accepted"
+        return f"Great — I’ll prepare the next step for {cname} using the slots and offer already in context, then bring back one reviewable draft.", "customer action accepted"
+    if kind in {"research_digest", "research_digest_release", "category_research_digest_release"}:
+        return "Great — I’ll use the cited digest item and draft one patient-ready post for your review.", "research-to-patient-content handoff"
+    if kind in {"regulation_change", "compliance_alert", "compliance"}:
+        return "Great — I’ll turn the supplied circular and deadline into one short practice audit checklist.", "compliance checklist handoff"
+    if kind in {"active_planning_intent", "planning_intent"}:
+        offer = _offer_text(merchant)
+        anchor = f" around {offer}" if offer else " around the details already on file"
+        return f"Great — I’ll draft the first reviewable version{anchor} and leave any new price or promise for your approval.", "planning action handoff"
+    if kind in {"supply_alert", "supply_recall"}:
+        molecule = _text((trigger.get("payload") or {}).get("molecule"), "the affected medicine")
+        return f"Understood — I’ll draft the notice and pickup workflow for the supplied {molecule} batches.", "supply-alert workflow handoff"
+    offer = _offer_text(merchant)
+    anchor = f" using {offer}" if offer else " using the facts already supplied"
+    return f"Great — I’ll move this forward now{anchor} and bring back one reviewable draft next.", f"{kind.replace('_', ' ')} action handoff"
+
+
+def _question_response(state: dict[str, Any]) -> str:
+    trigger = state.get("trigger") or {}
+    category = state.get("category") or {}
+    merchant = state.get("merchant") or {}
+    customer = state.get("customer")
+    kind = _text(trigger.get("kind"), "request").lower()
+    if kind in {"research_digest", "research_digest_release", "category_research_digest_release"}:
+        item = _digest_item(category, trigger)
+        title = _text(item.get("title"), "the cited digest item")
+        return f"I’ll keep this to the supplied evidence: {title}. Reply YES and I’ll turn it into one reviewable patient-ready draft."
+    if kind in {"active_planning_intent", "planning_intent"}:
+        offer = _offer_text(merchant)
+        return f"I can show the first version using {offer or 'the details already on file'}; I won’t invent new pricing. Reply YES and I’ll draft it."
+    if kind in {"cde_opportunity", "webinar"}:
+        item = _digest_item(category, trigger)
+        return f"The supplied opportunity is {_text(item.get('title'), 'the listed session')}. Reply YES and I’ll save the date and registration details."
+    if customer:
+        return "I’ll keep the next step to the customer details already supplied. Reply YES and I’ll prepare one reviewable confirmation."
+    return f"I’ll answer from the {_category_slug(category, merchant, trigger)} context already supplied. Reply YES and I’ll prepare one focused draft for this trigger."
 
 
 @app.post("/v1/reply")
@@ -696,25 +1039,19 @@ async def reply(request: Request) -> JSONResponse:
             return JSONResponse({"action": "wait", "wait_seconds": 86400, "rationale": "The same canned auto-reply repeated; backing off 24 hours for the owner."})
         return JSONResponse({"action": "wait", "wait_seconds": 14400, "rationale": "Detected a canned business auto-reply; waiting for the owner instead of burning another turn."})
     state["auto_reply_count"] = 0
+    if _is_hostile(message):
+        state["ended"] = True
+        return JSONResponse({"action": "end", "rationale": "The merchant expressed hostility; Vera acknowledged the boundary by ending politely instead of arguing or sending another pitch."})
     if _is_off_topic(message):
-        return JSONResponse({"action": "send", "body": "I can help with the merchant-growth item in this thread, but not that unrelated request. Coming back to the original next step — shall I prepare the draft?", "cta": "open_ended", "rationale": "Politely declined the off-mission request and redirected to the active trigger."})
+        return JSONResponse({"action": "send", "body": "I can help with the merchant-growth item in this thread, but not that unrelated request. I’ll keep the original trigger focused; reply YES if you want the grounded draft.", "cta": "binary_yes_no", "rationale": "Politely declined the off-mission request and redirected to the active trigger with one low-friction next step."})
     if _is_intent_commitment(message):
-        context = state.get("category"), state.get("merchant"), state.get("trigger"), state.get("customer")
-        if all(context):
-            category, merchant, trigger, customer = context
-            kind = _text(trigger.get("kind"), "the request").replace("_", " ")
-            offer = _offer_text(merchant)
-            scope = "the selected customer group" if customer else "the requested merchant action"
-            body = f"Great — I’ll move this forward now for {scope}." + (f" I’ll keep {offer} as the real offer anchor." if offer else "") + " I’ll bring back one reviewable draft next."
-            return JSONResponse({"action": "send", "body": body, "cta": "binary_confirm_cancel", "rationale": f"Explicit commitment detected after the {kind} prompt; switched from qualification to execution."})
-        return JSONResponse({"action": "send", "body": "Great — I’ll move this forward now and bring back one reviewable draft next.", "cta": "binary_confirm_cancel", "rationale": "Explicit commitment detected; switched directly to action."})
+        body, fact = _commitment_response(state)
+        return JSONResponse({"action": "send", "body": body, "cta": "binary_confirm_cancel", "rationale": f"Explicit commitment detected; switched directly to action: {fact}."})
     # For a normal question, reuse the original four-context composition only
     # when it produces a distinct, useful follow-up; otherwise acknowledge and
     # ask one focused question rather than hallucinating an answer.
-    history = state.get("history") or []
-    previous = next((x.get("body", "") for x in reversed(history[:-1]) if x.get("from") == "bot"), "")
     if message.strip().endswith("?") or any(word in message.lower() for word in ("how", "what", "which", "price", "when")):
-        return JSONResponse({"action": "send", "body": "Good question. I’ll keep this to the details already in your context. Which single outcome matters most here: more bookings, a profile update, or a customer-ready message?", "cta": "open_ended", "rationale": "Answered with a constrained clarification so the next draft stays grounded and one-step."})
+        return JSONResponse({"action": "send", "body": _question_response(state), "cta": "binary_yes_no", "rationale": "Answered the question without inventing a fact and offered one trigger-specific next step."})
     return JSONResponse({"action": "send", "body": "Got it. I’ll keep the next step focused and grounded in the details already shared. Shall I prepare the draft?", "cta": "open_ended", "rationale": "Acknowledged the reply and offered one low-friction next step without inventing new facts."})
 
 

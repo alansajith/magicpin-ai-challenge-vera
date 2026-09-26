@@ -21,13 +21,13 @@ Author: magicpin AI Challenge Team
 # =============================================================================
 
 # Your bot's URL (where your bot is running)
-BOT_URL = "https://magicpin-ai-challenge-vera.onrender.com"
+BOT_URL = "https://magicpin-ai-challenge-vera.onrender.com/"
 
 # Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
 LLM_PROVIDER = "gemini"
 
-# Your API key (paste your key here)
-LLM_API_KEY = ""  # Set GEMINI_API_KEY in the environment before running.
+# Your API key is read from the environment; never commit credentials here.
+LLM_API_KEY = ""
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
 LLM_MODEL = "gemini-2.5-flash"  # <-- Optional: specify model or leave empty for default
@@ -57,6 +57,7 @@ from urllib import request as urlrequest, error as urlerror
 from abc import ABC, abstractmethod
 
 LLM_API_KEY = os.environ.get("GEMINI_API_KEY", LLM_API_KEY)
+BOT_URL = os.environ.get("VERA_BOT_URL", BOT_URL)
 
 try:
     import certifi
@@ -447,6 +448,10 @@ class BotClient:
             "received_at": datetime.utcnow().isoformat() + "Z", "turn_number": turn
         })
 
+    def teardown(self):
+        """Reset a local candidate bot before a repeatable simulator pass."""
+        return self._request("POST", "/v1/teardown", 5)
+
 # =============================================================================
 # LLM SCORING ENGINE
 # =============================================================================
@@ -639,6 +644,12 @@ class JudgeSimulator:
     def _warmup(self) -> bool:
         print_section("WARMUP")
 
+        reset, reset_err, _ = self.client.teardown()
+        if reset_err:
+            print_warn(f"teardown unavailable; continuing without reset: {reset_err}")
+        elif reset and reset.get("ok"):
+            print_info("candidate bot state reset for a clean simulator run")
+
         data, err, lat = self.client.healthz()
         if err:
             print_fail(f"healthz: {err}")
@@ -818,11 +829,21 @@ class JudgeSimulator:
 
         print_section("FULL EVALUATION")
 
+        push_failures = []
         for mid, m in self.dataset.merchants.items():
-            self.client.push_context("merchant", mid, 1, m)
+            data, err, _ = self.client.push_context("merchant", mid, 1, m)
+            if err or not (data and data.get("accepted")):
+                push_failures.append(f"merchant/{mid}")
         for tid, t in self.dataset.triggers.items():
-            self.client.push_context("trigger", tid, 1, t)
+            data, err, _ = self.client.push_context("trigger", tid, 1, t)
+            if err or not (data and data.get("accepted")):
+                push_failures.append(f"trigger/{tid}")
 
+        if push_failures:
+            print_fail(f"Context push failed for {len(push_failures)} item(s); refusing to score stale state")
+            for item in push_failures[:5]:
+                print_warn(item)
+            return False
         print_success("All contexts pushed")
 
         print_section("SCORING COMPOSITIONS")
