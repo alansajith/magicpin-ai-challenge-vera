@@ -21,7 +21,7 @@ Author: magicpin AI Challenge Team
 # =============================================================================
 
 # Your bot's URL (where your bot is running)
-BOT_URL = "https://magicpin-ai-challenge-vera.onrender.com/"
+BOT_URL = "https://magicpin-ai-challenge-vera.onrender.com"
 
 # Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
 LLM_PROVIDER = "gemini"
@@ -830,8 +830,13 @@ class JudgeSimulator:
         print_section("FULL EVALUATION")
 
         push_failures = []
+        warmed_merchants = set(list(self.dataset.merchants.keys())[:5])
         for mid, m in self.dataset.merchants.items():
-            data, err, _ = self.client.push_context("merchant", mid, 1, m)
+            # _warmup already loaded the first five merchants at v1. Reusing
+            # v1 would correctly return 409 stale_version, so advance those
+            # contexts while leaving the remaining base contexts at v1.
+            version = 2 if mid in warmed_merchants else 1
+            data, err, _ = self.client.push_context("merchant", mid, version, m)
             if err or not (data and data.get("accepted")):
                 push_failures.append(f"merchant/{mid}")
         for tid, t in self.dataset.triggers.items():
